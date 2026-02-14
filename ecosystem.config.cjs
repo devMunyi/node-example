@@ -2,7 +2,7 @@ module.exports = {
   apps: [
     {
       name: "express-app",
-      script: "./dist/index.js", // TypeScript compiled output
+      script: "./dist/index.js", // This is correct!
       instances: "max",
       exec_mode: "cluster",
       watch: false,
@@ -15,6 +15,14 @@ module.exports = {
       autorestart: true,
       max_restarts: 10,
       min_uptime: "10s",
+      env: {
+        NODE_ENV: "development",
+        PORT: 8000
+      },
+      env_production: {
+        NODE_ENV: "production",
+        PORT: 8000
+      }
     },
   ],
 };
