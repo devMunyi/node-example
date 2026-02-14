@@ -115,6 +115,11 @@ jobs:
           tar -xzf deploy.tar.gz -C current
           rm deploy.tar.gz
           
+          # Copy persistent .env file from parent directory
+          if [ -f ".env" ]; then
+            cp .env current/.env
+          fi
+          
           # Install production dependencies
           cd current
           npm ci --only=production
@@ -133,7 +138,7 @@ jobs:
 
       - name: Health check
         run: |
-          sleep 10
+          sleep 15
           curl -f http://${{ secrets.DO_HOST }}/health || exit 1
 
       - name: Rollback on failure
