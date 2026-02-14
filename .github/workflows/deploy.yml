@@ -1,0 +1,157 @@
+name: Deploy to DigitalOcean
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # Allow manual trigger
+
+env:
+  NODE_VERSION: '20.x'
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run linter
+        run: npm run lint --if-present
+
+      - name: Run tests
+        run: npm test --if-present
+
+  build:
+    name: Build Application
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript
+        run: npm run build
+
+      - name: Create deployment package
+        run: |
+          mkdir -p deploy
+          cp -r dist deploy/
+          cp package*.json deploy/
+          cp ecosystem.config.cjs deploy/
+          [ -f .env.example ] && cp .env.example deploy/ || true
+          tar -czf deploy.tar.gz -C deploy .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-package
+          path: deploy.tar.gz
+          retention-days: 1
+
+  deploy:
+    name: Deploy to DigitalOcean
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-package
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DO_SSH_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.DO_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Copy files to server
+        run: |
+          scp -i ~/.ssh/deploy_key -P ${{ secrets.DO_SSH_PORT }} \
+            deploy.tar.gz \
+            ${{ secrets.DO_USERNAME }}@${{ secrets.DO_HOST }}:/var/www/nodejs-app/
+
+      - name: Deploy application
+        run: |
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.DO_SSH_PORT }} \
+            ${{ secrets.DO_USERNAME }}@${{ secrets.DO_HOST }} << 'DEPLOY_SCRIPT'
+          
+          set -e
+          
+          # Load NVM
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+          
+          cd /var/www/nodejs-app
+          
+          # Backup current deployment
+          if [ -d "current" ]; then
+            rm -rf previous
+            mv current previous
+          fi
+          
+          # Extract new deployment
+          mkdir -p current
+          tar -xzf deploy.tar.gz -C current
+          rm deploy.tar.gz
+          
+          # Install production dependencies
+          cd current
+          npm ci --only=production
+          
+          # Reload application with zero-downtime
+          pm2 reload ecosystem.config.cjs --env production || pm2 start ecosystem.config.cjs --env production
+          
+          # Save PM2 process list
+          pm2 save
+          
+          # Cleanup old logs (keep last 7 days)
+          find /var/log/pm2 -name "*.log" -mtime +7 -delete 2>/dev/null || true
+          
+          echo "Deployment completed successfully!"
+          DEPLOY_SCRIPT
+
+      - name: Health check
+        run: |
+          sleep 10
+          curl -f http://${{ secrets.DO_HOST }}/health || exit 1
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          ssh -i ~/.ssh/deploy_key -p ${{ secrets.DO_SSH_PORT }} \
+            ${{ secrets.DO_USERNAME }}@${{ secrets.DO_HOST }} << 'ROLLBACK_SCRIPT'
+          
+          # Load NVM
+          export NVM_DIR="$HOME/.nvm"
+          [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+          
+          cd /var/www/nodejs-app
+          if [ -d "previous" ]; then
+            rm -rf current
+            mv previous current
+            cd current
+            pm2 reload ecosystem.config.cjs --env production
+            echo "Rollback completed!"
+          fi
+          ROLLBACK_SCRIPT
